@@ -1,0 +1,84 @@
+# Higress EKS 部署配置文件示例
+# 复制此文件为 config.yaml 并填入您的实际值
+
+# AWS 配置
+aws:
+  region: us-east-1                    # AWS 区域
+  account_id: YOUR_AWS_ACCOUNT_ID      # AWS 账户 ID（可选，会自动获取）
+
+# VPC 网络配置
+vpc:
+  vpc_id: vpc-xxxxxxxxx                # 您的 VPC ID
+  
+  # 公有子网（用于 ALB，需要 3 个跨不同可用区）
+  public_subnets:
+    - subnet-public-1-xxxxxxxxx        # 可用区 1 的公有子网
+    - subnet-public-2-xxxxxxxxx        # 可用区 2 的公有子网
+    - subnet-public-3-xxxxxxxxx        # 可用区 3 的公有子网
+  
+  # 私有子网（用于 EKS 节点，需要 3 个跨不同可用区）
+  private_subnets:
+    - subnet-private-1-xxxxxxxxx       # 可用区 1 的私有子网
+    - subnet-private-2-xxxxxxxxx       # 可用区 2 的私有子网
+    - subnet-private-3-xxxxxxxxx       # 可用区 3 的私有子网
+
+# EKS 集群配置
+eks:
+  cluster_name: higress-prod           # EKS 集群名称
+  kubernetes_version: '1.29'           # Kubernetes 版本（1.28, 1.29, 1.30）
+  node_group_name: higress-nodes       # 节点组名称
+  
+  # 节点配置
+  instance_type: c6i.xlarge            # 实例类型（推荐：c6i.xlarge, c5.xlarge）
+  desired_capacity: 3                  # 期望节点数
+  min_size: 3                          # 最小节点数
+  max_size: 6                          # 最大节点数
+  volume_size: 100                     # 每个节点的磁盘大小（GB）
+
+# Higress 配置
+higress:
+  # 负载均衡器类型
+  use_alb: true                        # true: 使用 ALB, false: 使用 NLB
+  
+  # 副本配置
+  replicas: 3                          # Higress Gateway 副本数
+  
+  # 资源配置
+  cpu_request: 1000m                   # CPU 请求（1000m = 1 核）
+  memory_request: 2Gi                  # 内存请求
+  cpu_limit: 2000m                     # CPU 限制
+  memory_limit: 4Gi                    # 内存限制
+  
+  # 自动扩缩容配置
+  enable_autoscaling: true             # 是否启用自动扩缩容
+  min_replicas: 3                      # 最小副本数
+  max_replicas: 10                     # 最大副本数
+
+# ALB 配置
+alb:
+  # SSL 证书（可选）
+  # 留空：仅创建 HTTP (80) 监听器
+  # 配置证书：创建 HTTP + HTTPS (443) 监听器，并自动将 HTTP 重定向到 HTTPS
+  certificate_arn: ''                  # ACM 证书 ARN，例如：arn:aws:acm:us-east-1:123456789012:certificate/xxxxx
+  
+  # 如何获取证书：
+  # 1. 申请证书: aws acm request-certificate --domain-name yourdomain.com --validation-method DNS
+  # 2. 验证域名所有权（在 DNS 中添加验证记录）
+  # 3. 获取证书 ARN: aws acm list-certificates
+  # 4. 将证书 ARN 填入上面的 certificate_arn 字段
+  
+  # 其他 ALB 配置（可选）
+  # access_logs_bucket: ''             # 访问日志 S3 存储桶
+  # waf_acl_arn: ''                    # WAF ACL ARN
+
+# 监控配置（可选）
+monitoring:
+  enabled: true                        # 是否启用监控
+  prometheus: true                     # 是否安装 Prometheus
+  grafana: true                        # 是否安装 Grafana
+
+# 标签（可选）
+tags:
+  Environment: production
+  Project: higress
+  ManagedBy: higress-deploy-cli
