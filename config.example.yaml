@@ -29,10 +29,10 @@ eks:
   node_group_name: higress-nodes       # 节点组名称
   
   # 节点配置
-  instance_type: c6i.xlarge            # 实例类型（推荐：c6i.xlarge, c5.xlarge）
-  desired_capacity: 3                  # 期望节点数
+  instance_type: m6i.2xlarge            # m6i.2xlarge, m7i.2xlarge）
+  desired_capacity: 5                  # 期望节点数
   min_size: 3                          # 最小节点数
-  max_size: 6                          # 最大节点数
+  max_size: 5                          # 最大节点数
   volume_size: 100                     # 每个节点的磁盘大小（GB）
 
 # Higress 配置

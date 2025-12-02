@@ -20,6 +20,8 @@ class HigressDeployer:
     def __init__(self, config_path: str = "config.yaml"):
         self.config_path = config_path
         self.config = self._load_config()
+        # 每次初始化时都重新生成配置文件，确保配置同步
+        self._regenerate_config_files()
         
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
@@ -35,6 +37,358 @@ class HigressDeployer:
         except yaml.YAMLError as e:
             click.echo(f"✗ 配置文件格式错误: {e}", err=True)
             sys.exit(1)
+    
+    def _validate_config(self):
+        """验证配置的完整性和有效性"""
+        errors = []
+        
+        # 检查必需的配置项
+        required_paths = [
+            ('aws.region', ['aws', 'region']),
+            ('vpc.vpc_id', ['vpc', 'vpc_id']),
+            ('vpc.public_subnets', ['vpc', 'public_subnets']),
+            ('vpc.private_subnets', ['vpc', 'private_subnets']),
+            ('eks.cluster_name', ['eks', 'cluster_name']),
+            ('eks.kubernetes_version', ['eks', 'kubernetes_version']),
+            ('eks.instance_type', ['eks', 'instance_type']),
+            ('eks.desired_capacity', ['eks', 'desired_capacity']),
+            ('eks.min_size', ['eks', 'min_size']),
+            ('eks.max_size', ['eks', 'max_size']),
+            ('eks.volume_size', ['eks', 'volume_size']),
+        ]
+        
+        for path_name, path_keys in required_paths:
+            value = self.config
+            for key in path_keys:
+                if isinstance(value, dict):
+                    value = value.get(key)
+                else:
+                    value = None
+                    break
+            
+            if value is None or (isinstance(value, str) and not value.strip()):
+                errors.append(f"缺少必需配置: {path_name}")
+        
+        # 检查子网数量
+        public_subnets = self.config.get('vpc', {}).get('public_subnets', [])
+        private_subnets = self.config.get('vpc', {}).get('private_subnets', [])
+        
+        if len(public_subnets) != 3:
+            errors.append(f"公有子网数量应为 3，当前为 {len(public_subnets)}")
+        if len(private_subnets) != 3:
+            errors.append(f"私有子网数量应为 3，当前为 {len(private_subnets)}")
+        
+        # 检查节点配置的逻辑
+        min_size = self.config.get('eks', {}).get('min_size', 0)
+        max_size = self.config.get('eks', {}).get('max_size', 0)
+        desired_capacity = self.config.get('eks', {}).get('desired_capacity', 0)
+        
+        if min_size > max_size:
+            errors.append(f"min_size ({min_size}) 不能大于 max_size ({max_size})")
+        if desired_capacity < min_size or desired_capacity > max_size:
+            errors.append(f"desired_capacity ({desired_capacity}) 应在 min_size ({min_size}) 和 max_size ({max_size}) 之间")
+        
+        return errors
+    
+    def _regenerate_config_files(self):
+        """重新生成所有派生配置文件，确保与 config.yaml 同步"""
+        try:
+            # 验证配置
+            errors = self._validate_config()
+            if errors:
+                click.echo("⚠ 警告：配置验证发现问题:", err=True)
+                for error in errors:
+                    click.echo(f"  - {error}", err=True)
+                click.echo("请检查 config.yaml 并修正这些问题", err=True)
+                return
+            
+            # 生成 EKS 集群配置
+            self._generate_eks_config_file()
+            # 生成 Higress values 配置
+            self._generate_higress_values_file()
+            # 生成 ALB Ingress 配置
+            self._generate_alb_ingress_file()
+        except Exception as e:
+            # 配置文件生成失败不应该阻止程序启动，只记录警告
+            click.echo(f"⚠ 警告：配置文件生成失败: {e}", err=True)
+    
+    def _generate_eks_config_file(self):
+        """生成 EKS 集群配置文件"""
+        config = self.config
+        region = config['aws']['region']
+        azs = ['a', 'b', 'c']
+        
+        eks_config = {
+            'apiVersion': 'eksctl.io/v1alpha5',
+            'kind': 'ClusterConfig',
+            'metadata': {
+                'name': config['eks']['cluster_name'],
+                'region': region,
+                'version': config['eks']['kubernetes_version']
+            },
+            'vpc': {
+                'id': config['vpc']['vpc_id'],
+                'subnets': {
+                    'public': {
+                        f"{region}{az}": {'id': subnet}
+                        for az, subnet in zip(azs, config['vpc']['public_subnets'])
+                    },
+                    'private': {
+                        f"{region}{az}": {'id': subnet}
+                        for az, subnet in zip(azs, config['vpc']['private_subnets'])
+                    }
+                }
+            },
+            'iam': {
+                'withOIDC': True
+            },
+            'managedNodeGroups': [{
+                'name': config['eks']['node_group_name'],
+                'instanceType': config['eks']['instance_type'],
+                'desiredCapacity': config['eks']['desired_capacity'],
+                'minSize': config['eks']['min_size'],
+                'maxSize': config['eks']['max_size'],
+                'volumeSize': config['eks']['volume_size'],
+                'volumeType': 'gp3',
+                'privateNetworking': True,
+                'subnets': config['vpc']['private_subnets'],
+                'labels': {
+                    'role': 'higress',
+                    'environment': 'production'
+                },
+                'tags': {
+                    'Name': 'higress-node',
+                    'Environment': 'production'
+                },
+                'iam': {
+                    'withAddonPolicies': {
+                        'autoScaler': True,
+                        'albIngress': True,
+                        'cloudWatch': True,
+                        'ebs': True
+                    }
+                }
+            }],
+            'cloudWatch': {
+                'clusterLogging': {
+                    'enableTypes': ['api', 'audit', 'authenticator', 'controllerManager', 'scheduler']
+                }
+            }
+        }
+        
+        config_file = 'eks-cluster-config.yaml'
+        with open(config_file, 'w', encoding='utf-8') as f:
+            yaml.dump(eks_config, f, default_flow_style=False)
+    
+    def _generate_higress_values_file(self):
+        """生成 Higress Helm values 文件"""
+        higress_config = self.config.get('higress', {})
+        use_alb = higress_config.get('use_alb', True)
+        enable_monitoring = higress_config.get('enable_monitoring', False)
+        
+        if use_alb:
+            values = {
+                'global': {
+                    'local': False,
+                    'o11y': {
+                        'enabled': enable_monitoring
+                    }
+                },
+                'higress-core': {
+                    'gateway': {
+                        'replicas': higress_config.get('replicas', 3),
+                        'resources': {
+                            'requests': {
+                                'cpu': higress_config.get('cpu_request', '1000m'),
+                                'memory': higress_config.get('memory_request', '2Gi')
+                            },
+                            'limits': {
+                                'cpu': higress_config.get('cpu_limit', '2000m'),
+                                'memory': higress_config.get('memory_limit', '4Gi')
+                            }
+                        },
+                        'service': {
+                            'type': 'NodePort',
+                            'ports': [
+                                {'name': 'http', 'port': 80, 'targetPort': 80, 'nodePort': 30080},
+                                {'name': 'https', 'port': 443, 'targetPort': 443, 'nodePort': 30443}
+                            ]
+                        },
+                        'affinity': {
+                            'podAntiAffinity': {
+                                'requiredDuringSchedulingIgnoredDuringExecution': [{
+                                    'labelSelector': {
+                                        'matchExpressions': [{
+                                            'key': 'app',
+                                            'operator': 'In',
+                                            'values': ['higress-gateway']
+                                        }]
+                                    },
+                                    'topologyKey': 'kubernetes.io/hostname'
+                                }]
+                            }
+                        },
+                        'podDisruptionBudget': {
+                            'enabled': True,
+                            'minAvailable': 2
+                        },
+                        'autoscaling': {
+                            'enabled': higress_config.get('enable_autoscaling', True),
+                            'minReplicas': higress_config.get('min_replicas', 3),
+                            'maxReplicas': higress_config.get('max_replicas', 10),
+                            'targetCPUUtilizationPercentage': 70,
+                            'targetMemoryUtilizationPercentage': 80
+                        }
+                    },
+                    'controller': {
+                        'replicas': 2,
+                        'resources': {
+                            'requests': {'cpu': '500m', 'memory': '1Gi'},
+                            'limits': {'cpu': '1000m', 'memory': '2Gi'}
+                        }
+                    }
+                },
+                'higress-console': {
+                    'enabled': True,
+                    'replicas': 2,
+                    'service': {'type': 'ClusterIP'},
+                    'resources': {
+                        'requests': {'cpu': '200m', 'memory': '512Mi'},
+                        'limits': {'cpu': '500m', 'memory': '1Gi'}
+                    },
+                    'grafana': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '10Gi'
+                        }
+                    },
+                    'prometheus': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '20Gi'
+                        }
+                    },
+                    'loki': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '20Gi'
+                        }
+                    }
+                }
+            }
+        else:
+            values = {
+                'global': {'local': False, 'o11y': {'enabled': enable_monitoring}},
+                'higress-core': {
+                    'gateway': {
+                        'replicas': higress_config.get('replicas', 3),
+                        'resources': {
+                            'requests': {'cpu': '1000m', 'memory': '2Gi'},
+                            'limits': {'cpu': '2000m', 'memory': '4Gi'}
+                        },
+                        'service': {
+                            'type': 'LoadBalancer',
+                            'annotations': {
+                                'service.beta.kubernetes.io/aws-load-balancer-type': 'nlb',
+                                'service.beta.kubernetes.io/aws-load-balancer-scheme': 'internet-facing',
+                                'service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled': 'true'
+                            }
+                        }
+                    }
+                },
+                'higress-console': {
+                    'enabled': True,
+                    'grafana': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '10Gi'
+                        }
+                    },
+                    'prometheus': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '20Gi'
+                        }
+                    },
+                    'loki': {
+                        'persistence': {
+                            'enabled': True,
+                            'storageClassName': 'ebs-gp3',
+                            'size': '20Gi'
+                        }
+                    }
+                }
+            }
+        
+        values_file = 'higress-values.yaml'
+        with open(values_file, 'w', encoding='utf-8') as f:
+            yaml.dump(values, f, default_flow_style=False)
+    
+    def _generate_alb_ingress_file(self):
+        """生成 ALB Ingress 配置文件"""
+        config = self.config
+        subnets = ','.join(config['vpc']['public_subnets'])
+        cert_arn = config.get('alb', {}).get('certificate_arn', '').strip()
+        has_certificate = bool(cert_arn)
+        
+        if has_certificate:
+            listen_ports = '[{"HTTP": 80}, {"HTTPS": 443}]'
+        else:
+            listen_ports = '[{"HTTP": 80}]'
+        
+        ingress_config = {
+            'apiVersion': 'networking.k8s.io/v1',
+            'kind': 'Ingress',
+            'metadata': {
+                'name': 'higress-alb',
+                'namespace': 'higress-system',
+                'annotations': {
+                    'alb.ingress.kubernetes.io/scheme': 'internet-facing',
+                    'alb.ingress.kubernetes.io/target-type': 'instance',
+                    'alb.ingress.kubernetes.io/subnets': subnets,
+                    'alb.ingress.kubernetes.io/healthcheck-path': '/',
+                    'alb.ingress.kubernetes.io/healthcheck-port': '30080',
+                    'alb.ingress.kubernetes.io/healthcheck-protocol': 'HTTP',
+                    'alb.ingress.kubernetes.io/healthcheck-interval-seconds': '30',
+                    'alb.ingress.kubernetes.io/healthcheck-timeout-seconds': '5',
+                    'alb.ingress.kubernetes.io/healthy-threshold-count': '2',
+                    'alb.ingress.kubernetes.io/unhealthy-threshold-count': '3',
+                    'alb.ingress.kubernetes.io/listen-ports': listen_ports,
+                    'alb.ingress.kubernetes.io/tags': 'Environment=production,Application=higress'
+                }
+            },
+            'spec': {
+                'ingressClassName': 'alb',
+                'rules': [{
+                    'http': {
+                        'paths': [{
+                            'path': '/',
+                            'pathType': 'Prefix',
+                            'backend': {
+                                'service': {
+                                    'name': 'higress-gateway',
+                                    'port': {'number': 80}
+                                }
+                            }
+                        }]
+                    }
+                }]
+            }
+        }
+        
+        if has_certificate:
+            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/certificate-arn'] = cert_arn
+            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/ssl-redirect'] = '443'
+            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/ssl-policy'] = 'ELBSecurityPolicy-TLS-1-2-2017-01'
+        
+        ingress_file = 'higress-alb-ingress.yaml'
+        with open(ingress_file, 'w', encoding='utf-8') as f:
+            yaml.dump(ingress_config, f, default_flow_style=False)
     
     def _run_command(self, cmd: str, check: bool = True, capture: bool = False) -> Optional[str]:
         """执行 shell 命令"""
@@ -115,78 +469,141 @@ class HigressDeployer:
     def _create_eks_config(self) -> str:
         """创建 EKS 集群配置文件"""
         click.echo("\n生成 EKS 集群配置...")
-        
-        config = self.config
-        region = config['aws']['region']
-        
-        # 获取可用区
-        azs = ['a', 'b', 'c']
-        
-        eks_config = {
-            'apiVersion': 'eksctl.io/v1alpha5',
-            'kind': 'ClusterConfig',
-            'metadata': {
-                'name': config['eks']['cluster_name'],
-                'region': region,
-                'version': config['eks']['kubernetes_version']
-            },
-            'vpc': {
-                'id': config['vpc']['vpc_id'],
-                'subnets': {
-                    'public': {
-                        f"{region}{az}": {'id': subnet}
-                        for az, subnet in zip(azs, config['vpc']['public_subnets'])
-                    },
-                    'private': {
-                        f"{region}{az}": {'id': subnet}
-                        for az, subnet in zip(azs, config['vpc']['private_subnets'])
-                    }
-                }
-            },
-            'iam': {
-                'withOIDC': True
-            },
-            'managedNodeGroups': [{
-                'name': config['eks']['node_group_name'],
-                'instanceType': config['eks']['instance_type'],
-                'desiredCapacity': config['eks']['desired_capacity'],
-                'minSize': config['eks']['min_size'],
-                'maxSize': config['eks']['max_size'],
-                'volumeSize': config['eks']['volume_size'],
-                'volumeType': 'gp3',
-                'privateNetworking': True,
-                'subnets': config['vpc']['private_subnets'],
-                'labels': {
-                    'role': 'higress',
-                    'environment': 'production'
-                },
-                'tags': {
-                    'Name': 'higress-node',
-                    'Environment': 'production'
-                },
-                'iam': {
-                    'withAddonPolicies': {
-                        'autoScaler': True,
-                        'albIngress': True,
-                        'cloudWatch': True,
-                        'ebs': True
-                    }
-                }
-            }],
-            'cloudWatch': {
-                'clusterLogging': {
-                    'enableTypes': ['api', 'audit', 'authenticator', 'controllerManager', 'scheduler']
-                }
-            }
-        }
-        
+        self._generate_eks_config_file()
         config_file = 'eks-cluster-config.yaml'
-        with open(config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(eks_config, f, default_flow_style=False)
-        
         click.echo(f"✓ EKS 配置文件已生成: {config_file}")
         return config_file
 
+    def _install_ebs_csi_driver(self):
+        """安装 EBS CSI Driver addon"""
+        click.echo("\n安装 EBS CSI Driver addon...")
+        
+        cluster_name = self.config['eks']['cluster_name']
+        region = self.config['aws']['region']
+        account_id = self._get_aws_account_id()
+        
+        # 创建 EBS CSI Driver 的 IAM 策略
+        click.echo("创建 EBS CSI Driver IAM 策略...")
+        policy_url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-ebs-csi-driver/master/docs/example-iam-policy.json"
+        self._run_command(f"curl -o ebs-csi-policy.json {policy_url}")
+        
+        policy_name = "AmazonEKS_EBS_CSI_Driver_Policy"
+        policy_arn = f"arn:aws:iam::{account_id}:policy/{policy_name}"
+        
+        # 创建策略（如果不存在）
+        cmd = f"aws iam create-policy --policy-name {policy_name} --policy-document file://ebs-csi-policy.json"
+        self._run_command(cmd, check=False)
+        
+        # 检查并删除现有的 ServiceAccount（如果存在冲突）
+        click.echo("检查现有的 ServiceAccount...")
+        check_sa = self._run_command(
+            "kubectl get serviceaccount ebs-csi-controller-sa -n kube-system",
+            check=False, capture=True
+        )
+        
+        if check_sa and "ebs-csi-controller-sa" in check_sa:
+            click.echo("发现现有的 ServiceAccount，删除以避免冲突...")
+            self._run_command("kubectl delete serviceaccount ebs-csi-controller-sa -n kube-system", check=False)
+            time.sleep(5)
+        
+        # 创建 IAM 服务账户
+        click.echo("创建 EBS CSI Driver IAM 服务账户...")
+        cmd = f"""eksctl create iamserviceaccount \
+            --cluster={cluster_name} \
+            --namespace=kube-system \
+            --name=ebs-csi-controller-sa \
+            --attach-policy-arn={policy_arn} \
+            --override-existing-serviceaccounts \
+            --region={region} \
+            --approve"""
+        self._run_command(cmd)
+        
+        # 获取 IAM 角色 ARN
+        click.echo("获取 IAM 角色 ARN...")
+        role_name = f"eksctl-{cluster_name}-addon-iamserviceaccount-kube-system-ebs-csi-controller-sa"
+        
+        # 尝试获取角色 ARN
+        get_role_cmd = f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text"
+        role_arn = self._run_command(get_role_cmd, check=False, capture=True)
+        
+        if not role_arn or "NoSuchEntity" in role_arn:
+            # 如果找不到，尝试列出所有角色并查找
+            click.echo("尝试查找 EBS CSI 相关的 IAM 角色...")
+            list_roles_cmd = f"aws iam list-roles --query 'Roles[?contains(RoleName, `ebs-csi`)].RoleName' --output text"
+            roles = self._run_command(list_roles_cmd, check=False, capture=True)
+            
+            if roles:
+                # 使用找到的第一个角色
+                role_name = roles.strip().split()[0]
+                role_arn = self._run_command(
+                    f"aws iam get-role --role-name {role_name} --query 'Role.Arn' --output text",
+                    check=False, capture=True
+                )
+        
+        # 安装 EBS CSI Driver addon
+        click.echo("安装 EBS CSI Driver addon...")
+        
+        if role_arn and role_arn.strip() and "arn:aws:iam" in role_arn:
+            # 使用找到的角色 ARN
+            cmd = f"""aws eks create-addon \
+                --cluster-name {cluster_name} \
+                --addon-name aws-ebs-csi-driver \
+                --service-account-role-arn {role_arn.strip()} \
+                --resolve-conflicts OVERWRITE \
+                --region {region}"""
+        else:
+            # 不指定角色，让 EKS 自动处理
+            cmd = f"""aws eks create-addon \
+                --cluster-name {cluster_name} \
+                --addon-name aws-ebs-csi-driver \
+                --resolve-conflicts OVERWRITE \
+                --region {region}"""
+        
+        # 如果 addon 已存在，尝试更新
+        result = self._run_command(cmd, check=False, capture=True)
+        
+        if result and "already exists" in result:
+            click.echo("EBS CSI Driver addon 已存在，尝试更新...")
+            if role_arn and role_arn.strip() and "arn:aws:iam" in role_arn:
+                cmd = f"""aws eks update-addon \
+                    --cluster-name {cluster_name} \
+                    --addon-name aws-ebs-csi-driver \
+                    --service-account-role-arn {role_arn.strip()} \
+                    --resolve-conflicts OVERWRITE \
+                    --region {region}"""
+            else:
+                cmd = f"""aws eks update-addon \
+                    --cluster-name {cluster_name} \
+                    --addon-name aws-ebs-csi-driver \
+                    --resolve-conflicts OVERWRITE \
+                    --region {region}"""
+            self._run_command(cmd, check=False)
+        
+        # 等待 addon 就绪
+        click.echo("等待 EBS CSI Driver addon 就绪...")
+        for i in range(30):
+            time.sleep(10)
+            status_cmd = f"aws eks describe-addon --cluster-name {cluster_name} --addon-name aws-ebs-csi-driver --region {region} --query 'addon.status' --output text"
+            status = self._run_command(status_cmd, check=False, capture=True)
+            
+            if status and "ACTIVE" in status:
+                click.echo("✓ EBS CSI Driver addon 已激活")
+                break
+            elif status and "CREATE_FAILED" in status:
+                click.echo("✗ EBS CSI Driver addon 创建失败")
+                # 显示详细错误
+                self._run_command(f"aws eks describe-addon --cluster-name {cluster_name} --addon-name aws-ebs-csi-driver --region {region}", check=False)
+                break
+            
+            if (i + 1) % 3 == 0:
+                click.echo(f"  等待中... 状态: {status.strip() if status else 'Unknown'}")
+        
+        # 验证安装
+        click.echo("\n验证 EBS CSI Driver 安装...")
+        self._run_command("kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver", check=False)
+        
+        click.echo("✓ EBS CSI Driver addon 安装完成")
+    
     def create_eks_cluster(self):
         """创建 EKS 集群"""
         click.echo("\n" + "="*60)
@@ -210,6 +627,9 @@ class HigressDeployer:
         # 验证集群
         click.echo("\n验证集群状态...")
         self._run_command("kubectl get nodes")
+        
+        # 安装 EBS CSI Driver
+        self._install_ebs_csi_driver()
         
         click.echo("\n" + "="*60)
         click.echo("✓ EKS 集群创建完成")
@@ -244,9 +664,10 @@ class HigressDeployer:
                 "elasticloadbalancing:ModifyListenerCertificates"
             ]
             
-            # 查找包含 elasticloadbalancing 权限的 Statement
+            # 只在第一个包含 elasticloadbalancing 权限的 Statement 中添加
+            added = False
             for statement in policy.get('Statement', []):
-                if statement.get('Effect') == 'Allow':
+                if not added and statement.get('Effect') == 'Allow':
                     actions = statement.get('Action', [])
                     if isinstance(actions, list):
                         # 检查是否包含 elasticloadbalancing 相关权限
@@ -257,6 +678,7 @@ class HigressDeployer:
                                 if perm not in actions:
                                     actions.append(perm)
                                     click.echo(f"  添加权限: {perm}")
+                            added = True
             
             # 保存更新后的策略
             with open('iam-policy.json', 'w') as f:
@@ -367,110 +789,8 @@ class HigressDeployer:
     def _create_higress_values(self) -> str:
         """创建 Higress Helm values 文件"""
         click.echo("\n生成 Higress 配置...")
-        
-        higress_config = self.config.get('higress', {})
-        use_alb = higress_config.get('use_alb', True)
-        
-        if use_alb:
-            # 使用 ALB 方案
-            values = {
-                'global': {
-                    'local': False,
-                    'o11y': {
-                        'enabled': True
-                    }
-                },
-                'higress-core': {
-                    'gateway': {
-                        'replicas': higress_config.get('replicas', 3),
-                        'resources': {
-                            'requests': {
-                                'cpu': higress_config.get('cpu_request', '1000m'),
-                                'memory': higress_config.get('memory_request', '2Gi')
-                            },
-                            'limits': {
-                                'cpu': higress_config.get('cpu_limit', '2000m'),
-                                'memory': higress_config.get('memory_limit', '4Gi')
-                            }
-                        },
-                        'service': {
-                            'type': 'NodePort',
-                            'ports': [
-                                {'name': 'http', 'port': 80, 'targetPort': 80, 'nodePort': 30080},
-                                {'name': 'https', 'port': 443, 'targetPort': 443, 'nodePort': 30443}
-                            ]
-                        },
-                        'affinity': {
-                            'podAntiAffinity': {
-                                'requiredDuringSchedulingIgnoredDuringExecution': [{
-                                    'labelSelector': {
-                                        'matchExpressions': [{
-                                            'key': 'app',
-                                            'operator': 'In',
-                                            'values': ['higress-gateway']
-                                        }]
-                                    },
-                                    'topologyKey': 'kubernetes.io/hostname'
-                                }]
-                            }
-                        },
-                        'podDisruptionBudget': {
-                            'enabled': True,
-                            'minAvailable': 2
-                        },
-                        'autoscaling': {
-                            'enabled': higress_config.get('enable_autoscaling', True),
-                            'minReplicas': higress_config.get('min_replicas', 3),
-                            'maxReplicas': higress_config.get('max_replicas', 10),
-                            'targetCPUUtilizationPercentage': 70,
-                            'targetMemoryUtilizationPercentage': 80
-                        }
-                    },
-                    'controller': {
-                        'replicas': 2,
-                        'resources': {
-                            'requests': {'cpu': '500m', 'memory': '1Gi'},
-                            'limits': {'cpu': '1000m', 'memory': '2Gi'}
-                        }
-                    }
-                },
-                'higress-console': {
-                    'enabled': True,
-                    'replicas': 2,
-                    'service': {'type': 'ClusterIP'},
-                    'resources': {
-                        'requests': {'cpu': '200m', 'memory': '512Mi'},
-                        'limits': {'cpu': '500m', 'memory': '1Gi'}
-                    }
-                }
-            }
-        else:
-            # 使用 NLB 方案
-            values = {
-                'global': {'local': False, 'o11y': {'enabled': True}},
-                'higress-core': {
-                    'gateway': {
-                        'replicas': higress_config.get('replicas', 3),
-                        'resources': {
-                            'requests': {'cpu': '1000m', 'memory': '2Gi'},
-                            'limits': {'cpu': '2000m', 'memory': '4Gi'}
-                        },
-                        'service': {
-                            'type': 'LoadBalancer',
-                            'annotations': {
-                                'service.beta.kubernetes.io/aws-load-balancer-type': 'nlb',
-                                'service.beta.kubernetes.io/aws-load-balancer-scheme': 'internet-facing',
-                                'service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled': 'true'
-                            }
-                        }
-                    }
-                }
-            }
-        
+        self._generate_higress_values_file()
         values_file = 'higress-values.yaml'
-        with open(values_file, 'w', encoding='utf-8') as f:
-            yaml.dump(values, f, default_flow_style=False)
-        
         click.echo(f"✓ Higress 配置文件已生成: {values_file}")
         return values_file
 
@@ -538,43 +858,23 @@ class HigressDeployer:
         # 生成配置文件
         values_file = self._create_higress_values()
         
-        # 安装 Higress（带重试）
-        click.echo("\n安装 Higress（预计需要 3-5 分钟）...")
-        max_retries = 3
-        for attempt in range(max_retries):
-            if attempt > 0:
-                click.echo(f"\n重试安装 Higress (尝试 {attempt + 1}/{max_retries})...")
-                time.sleep(10)
-            
-            cmd = f"helm install higress higress.io/higress -n higress-system -f {values_file} --wait --timeout 10m"
-            result = self._run_command(cmd, check=False, capture=False)
-            
-            # 检查是否成功
-            check_result = self._run_command(
-                "helm list -n higress-system | grep higress",
-                check=False, capture=True
-            )
-            
-            if check_result and "deployed" in check_result:
-                click.echo("✓ Higress 安装成功")
-                break
-            
-            if attempt < max_retries - 1:
-                click.echo("安装失败，准备重试...")
-                # 清理失败的安装
-                self._run_command("helm uninstall higress -n higress-system", check=False)
-                time.sleep(5)
-        else:
-            click.echo("\n✗ Higress 安装失败")
-            click.echo("\n故障排查建议:")
-            click.echo("1. 检查 ALB Controller 状态:")
-            click.echo("   kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller")
-            click.echo("2. 查看 ALB Controller 日志:")
-            click.echo("   kubectl logs -n kube-system deployment/aws-load-balancer-controller")
-            click.echo("3. 检查 webhook 服务:")
-            click.echo("   kubectl get svc aws-load-balancer-webhook-service -n kube-system")
-            click.echo("   kubectl get endpoints aws-load-balancer-webhook-service -n kube-system")
-            sys.exit(1)
+        # 安装 Higress（不使用 --wait，因为监控组件可能需要更长时间）
+        click.echo("\n安装 Higress（预计需要 5-10 分钟）...")
+        
+        # 使用更长的超时时间，但不使用 --wait 来避免超时
+        cmd = f"helm install higress higress.io/higress -n higress-system -f {values_file} --timeout 30m"
+        self._run_command(cmd)
+        
+        # 等待核心组件就绪（Gateway 和 Controller）
+        click.echo("\n等待 Higress 核心组件就绪...")
+        self._run_command(
+            "kubectl wait --for=condition=ready pod -l app=higress-gateway -n higress-system --timeout=300s",
+            check=False
+        )
+        self._run_command(
+            "kubectl wait --for=condition=ready pod -l app=higress-controller -n higress-system --timeout=300s",
+            check=False
+        )
         
         # 验证安装
         click.echo("\n验证 Higress 安装...")
@@ -582,77 +882,27 @@ class HigressDeployer:
         self._run_command("kubectl get svc -n higress-system")
         
         click.echo("\n✓ Higress 部署完成")
+        click.echo("\n提示：监控组件（Grafana、Prometheus、Loki）可能需要额外时间来创建 PVC 和初始化")
+        click.echo("可以使用以下命令监控进度:")
+        click.echo("  kubectl get pvc -n higress-system")
+        click.echo("  kubectl get pods -n higress-system")
     
     def _create_alb_ingress(self) -> str:
         """创建 ALB Ingress 配置"""
         click.echo("\n生成 ALB Ingress 配置...")
         
-        config = self.config
-        subnets = ','.join(config['vpc']['public_subnets'])
-        
-        # 检查是否配置了证书
-        cert_arn = config.get('alb', {}).get('certificate_arn', '').strip()
+        cert_arn = self.config.get('alb', {}).get('certificate_arn', '').strip()
         has_certificate = bool(cert_arn)
         
         # 根据是否有证书决定监听端口
         if has_certificate:
-            listen_ports = '[{"HTTP": 80}, {"HTTPS": 443}]'
             click.echo("✓ 检测到 SSL 证书配置，将创建 HTTP + HTTPS 监听器")
         else:
-            listen_ports = '[{"HTTP": 80}]'
             click.echo("⚠ 未配置 SSL 证书，仅创建 HTTP 监听器")
             click.echo("  如需 HTTPS，请在 config.yaml 中配置 alb.certificate_arn")
         
-        ingress_config = {
-            'apiVersion': 'networking.k8s.io/v1',
-            'kind': 'Ingress',
-            'metadata': {
-                'name': 'higress-alb',
-                'namespace': 'higress-system',
-                'annotations': {
-                    'alb.ingress.kubernetes.io/scheme': 'internet-facing',
-                    'alb.ingress.kubernetes.io/target-type': 'instance',
-                    'alb.ingress.kubernetes.io/subnets': subnets,
-                    'alb.ingress.kubernetes.io/healthcheck-path': '/',
-                    'alb.ingress.kubernetes.io/healthcheck-port': '30080',
-                    'alb.ingress.kubernetes.io/healthcheck-protocol': 'HTTP',
-                    'alb.ingress.kubernetes.io/healthcheck-interval-seconds': '30',
-                    'alb.ingress.kubernetes.io/healthcheck-timeout-seconds': '5',
-                    'alb.ingress.kubernetes.io/healthy-threshold-count': '2',
-                    'alb.ingress.kubernetes.io/unhealthy-threshold-count': '3',
-                    'alb.ingress.kubernetes.io/listen-ports': listen_ports,
-                    'alb.ingress.kubernetes.io/tags': 'Environment=production,Application=higress'
-                }
-            },
-            'spec': {
-                'ingressClassName': 'alb',
-                'rules': [{
-                    'http': {
-                        'paths': [{
-                            'path': '/',
-                            'pathType': 'Prefix',
-                            'backend': {
-                                'service': {
-                                    'name': 'higress-gateway',
-                                    'port': {'number': 80}
-                                }
-                            }
-                        }]
-                    }
-                }]
-            }
-        }
-        
-        # 如果配置了证书，添加 SSL 配置
-        if has_certificate:
-            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/certificate-arn'] = cert_arn
-            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/ssl-redirect'] = '443'
-            ingress_config['metadata']['annotations']['alb.ingress.kubernetes.io/ssl-policy'] = 'ELBSecurityPolicy-TLS-1-2-2017-01'
-        
+        self._generate_alb_ingress_file()
         ingress_file = 'higress-alb-ingress.yaml'
-        with open(ingress_file, 'w', encoding='utf-8') as f:
-            yaml.dump(ingress_config, f, default_flow_style=False)
-        
         click.echo(f"✓ ALB Ingress 配置已生成: {ingress_file}")
         return ingress_file
     
@@ -1001,6 +1251,14 @@ def create(config):
 
 @cli.command()
 @click.option('--config', '-c', default='config.yaml', help='配置文件路径')
+def install_ebs_csi(config):
+    """安装 EBS CSI Driver addon"""
+    deployer = HigressDeployer(config)
+    deployer._install_ebs_csi_driver()
+
+
+@cli.command()
+@click.option('--config', '-c', default='config.yaml', help='配置文件路径')
 def install_alb(config):
     """安装 AWS Load Balancer Controller"""
     deployer = HigressDeployer(config)
@@ -1039,9 +1297,10 @@ def fix_alb_permissions(config):
             "elasticloadbalancing:ModifyListenerCertificates"
         ]
         
-        # 查找包含 elasticloadbalancing 权限的 Statement
+        # 只在第一个包含 elasticloadbalancing 权限的 Statement 中添加
+        added = False
         for statement in policy.get('Statement', []):
-            if statement.get('Effect') == 'Allow':
+            if not added and statement.get('Effect') == 'Allow':
                 actions = statement.get('Action', [])
                 if isinstance(actions, list):
                     has_elb = any('elasticloadbalancing' in action for action in actions)
@@ -1050,6 +1309,7 @@ def fix_alb_permissions(config):
                             if perm not in actions:
                                 actions.append(perm)
                                 click.echo(f"  添加权限: {perm}")
+                        added = True
         
         with open('iam-policy.json', 'w') as f:
             json.dump(policy, f, indent=2)
@@ -1151,6 +1411,36 @@ def status(config):
 
 
 @cli.command()
+@click.option('--config', '-c', default='config.yaml', help='配置文件路径')
+def validate(config):
+    """验证配置文件的完整性和一致性"""
+    click.echo("\n" + "="*60)
+    click.echo("验证配置文件")
+    click.echo("="*60)
+    
+    deployer = HigressDeployer(config)
+    errors = deployer._validate_config()
+    
+    if errors:
+        click.echo("\n✗ 配置验证失败，发现以下问题:\n")
+        for i, error in enumerate(errors, 1):
+            click.echo(f"  {i}. {error}")
+        click.echo("\n请编辑 config.yaml 修正这些问题")
+        sys.exit(1)
+    else:
+        click.echo("\n✓ 配置验证通过")
+        click.echo("\n配置摘要:")
+        click.echo(f"  集群名称: {deployer.config['eks']['cluster_name']}")
+        click.echo(f"  AWS 区域: {deployer.config['aws']['region']}")
+        click.echo(f"  Kubernetes 版本: {deployer.config['eks']['kubernetes_version']}")
+        click.echo(f"  节点类型: {deployer.config['eks']['instance_type']}")
+        click.echo(f"  节点数: {deployer.config['eks']['desired_capacity']} (min: {deployer.config['eks']['min_size']}, max: {deployer.config['eks']['max_size']})")
+        click.echo(f"  Higress 副本: {deployer.config['higress'].get('replicas', 3)}")
+        click.echo(f"  使用 ALB: {deployer.config['higress'].get('use_alb', True)}")
+        click.echo("\n✓ 所有配置文件已同步生成")
+
+
+@cli.command()
 @click.argument('resource', type=click.Choice(['eks', 'higress'], case_sensitive=False))
 @click.option('--config', '-c', default='config.yaml', help='配置文件路径')
 @click.option('--force', '-f', is_flag=True, help='强制删除，不需要确认')
@@ -1176,6 +1466,114 @@ def clean(resource, config, force):
         deployer.delete_higress(force)
     elif resource.lower() == 'eks':
         deployer.delete_cluster(force)
+
+
+@cli.command()
+@click.option('--config', '-c', default='config.yaml', help='配置文件路径')
+def fix_alb_security_group(config):
+    """修复 ALB Security Group 问题"""
+    deployer = HigressDeployer(config)
+    
+    click.echo("\n" + "="*60)
+    click.echo("修复 ALB Security Group 问题")
+    click.echo("="*60)
+    
+    region = deployer.config['aws']['region']
+    cluster_name = deployer.config['eks']['cluster_name']
+    vpc_id = deployer.config['vpc']['vpc_id']
+    
+    # 1. 获取集群 Security Group
+    click.echo("\n【步骤 1】获取集群 Security Group...")
+    cluster_sg_cmd = f"""aws eks describe-cluster \
+        --name {cluster_name} \
+        --region {region} \
+        --query 'cluster.resourcesVpcConfig.securityGroupIds[0]' \
+        --output text"""
+    cluster_sg = deployer._run_command(cluster_sg_cmd, check=False, capture=True)
+    
+    if not cluster_sg or "None" in cluster_sg:
+        click.echo("✗ 无法获取集群 Security Group")
+        sys.exit(1)
+    
+    cluster_sg = cluster_sg.strip()
+    click.echo(f"✓ 集群 Security Group: {cluster_sg}")
+    
+    # 2. 获取节点 Security Group
+    click.echo("\n【步骤 2】获取节点 Security Group...")
+    node_sg_cmd = f"""aws ec2 describe-security-groups \
+        --filters "Name=tag:aws:cloudformation:stack-name,Values=eksctl-{cluster_name}-nodegroup-*" \
+        --region {region} \
+        --query 'SecurityGroups[0].GroupId' \
+        --output text"""
+    node_sg = deployer._run_command(node_sg_cmd, check=False, capture=True)
+    
+    if not node_sg or "None" in node_sg:
+        click.echo("✗ 无法获取节点 Security Group")
+        sys.exit(1)
+    
+    node_sg = node_sg.strip()
+    click.echo(f"✓ 节点 Security Group: {node_sg}")
+    
+    # 3. 删除现有 Ingress
+    click.echo("\n【步骤 3】删除现有 Ingress...")
+    deployer._run_command("kubectl delete ingress higress-alb -n higress-system", check=False)
+    click.echo("等待 AWS 资源清理...")
+    time.sleep(30)
+    
+    # 4. 添加 Security Group 规则
+    click.echo("\n【步骤 4】添加 Security Group 规则...")
+    
+    # 允许节点 SG 接收来自集群 SG 的 30080 流量
+    click.echo("添加节点 SG 入站规则（30080 端口）...")
+    cmd = f"""aws ec2 authorize-security-group-ingress \
+        --group-id {node_sg} \
+        --protocol tcp \
+        --port 30080 \
+        --source-group {cluster_sg} \
+        --region {region}"""
+    deployer._run_command(cmd, check=False)
+    
+    # 允许节点 SG 接收来自集群 SG 的 30443 流量
+    click.echo("添加节点 SG 入站规则（30443 端口）...")
+    cmd = f"""aws ec2 authorize-security-group-ingress \
+        --group-id {node_sg} \
+        --protocol tcp \
+        --port 30443 \
+        --source-group {cluster_sg} \
+        --region {region}"""
+    deployer._run_command(cmd, check=False)
+    
+    # 5. 重新创建 Ingress
+    click.echo("\n【步骤 5】重新创建 Ingress...")
+    ingress_file = deployer._create_alb_ingress()
+    deployer._run_command(f"kubectl apply -f {ingress_file}")
+    
+    # 6. 等待 ALB 创建
+    click.echo("\n【步骤 6】等待 ALB 创建（最多 5 分钟）...")
+    for i in range(30):
+        result = deployer._run_command(
+            "kubectl get ingress higress-alb -n higress-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+            check=False, capture=True
+        )
+        
+        if result and result.strip():
+            click.echo(f"\n✓ ALB 创建成功！")
+            click.echo(f"ALB DNS: {result}")
+            with open('alb-endpoint.txt', 'w') as f:
+                f.write(result)
+            break
+        
+        if (i + 1) % 3 == 0:
+            click.echo(f"等待中... ({(i+1)*10}秒)")
+        time.sleep(10)
+    else:
+        click.echo("\n⚠ ALB 创建超时，请检查 Ingress 状态:")
+        deployer._run_command("kubectl describe ingress higress-alb -n higress-system")
+        sys.exit(1)
+    
+    click.echo("\n" + "="*60)
+    click.echo("✓ ALB Security Group 修复完成")
+    click.echo("="*60)
 
 
 @cli.command()

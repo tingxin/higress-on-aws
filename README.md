@@ -73,7 +73,8 @@ cat alb-endpoint.txt
 
 ```bash
 ./higress_deploy.py init              # 初始化配置文件
-./higress_deploy.py create            # 创建 EKS 集群
+./higress_deploy.py create            # 创建 EKS 集群（自动安装 EBS CSI Driver）
+./higress_deploy.py install-ebs-csi   # 安装 EBS CSI Driver（可选，create 已包含）
 ./higress_deploy.py install-alb       # 安装 ALB Controller
 ./higress_deploy.py deploy            # 部署 Higress
 ./higress_deploy.py create-lb         # 创建 ALB

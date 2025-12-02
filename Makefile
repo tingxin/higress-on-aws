@@ -35,6 +35,9 @@ init: ## 初始化配置文件
 create: ## 创建 EKS 集群
 	$(CLI) create -c $(CONFIG)
 
+install-ebs-csi: ## 安装 EBS CSI Driver addon
+	$(CLI) install-ebs-csi -c $(CONFIG)
+
 install-alb: ## 安装 ALB Controller
 	$(CLI) install-alb -c $(CONFIG)
 
@@ -213,6 +216,9 @@ fix-alb-permissions: ## 修复 ALB Controller IAM 权限问题
 	@echo ""
 	@echo "权限已修复，现在可以重新创建 ALB:"
 	@echo "  make create-lb"
+
+fix-ebs-csi: ## 修复 EBS CSI Driver 安装冲突
+	./fix-ebs-csi.sh
 
 fix-iam: ## 修复 IAM 策略权限
 	./fix-iam-policy.sh
