@@ -32,8 +32,38 @@
 - NAT Gateway 已配置
 
 ## 🚀 快速开始
+### 1. 安装必要工具
 
-### 1. 安装
+```bash
+#尝试使用setup.sh
+bash setup.sh
+```
+如果报错，分步骤
+# 安装 AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# 配置 AWS 凭证
+aws configure
+# 输入 Access Key ID、Secret Access Key、Region 等信息
+
+# 安装 kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl version --client
+
+# 安装 eksctl
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+eksctl version
+
+# 安装 Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+```
+
+### 2. 安装
 
 ```bash
 # 运行安装脚本
@@ -44,7 +74,7 @@ pip3 install -r requirements.txt
 chmod +x higress_deploy.py
 ```
 
-### 2. 初始化配置
+### 3. 初始化配置
 
 ```bash
 # 创建配置文件
@@ -54,15 +84,16 @@ chmod +x higress_deploy.py
 vim config.yaml
 ```
 
-### 3. 一键部署
+### 4. 按顺序部署
+
+**或手动执行各步骤**（详见 [部署顺序指南](DEPLOYMENT-ORDER.md)）：
 
 ```bash
-# 执行一键部署（约需 30-40 分钟）
-./higress_deploy.py install-all
-
-# 查看部署状态
-./higress_deploy.py status
-
+./higress_deploy.py create        # 创建 EKS 集群
+./higress_deploy.py install-alb   # 安装 ALB Controller
+./higress_deploy.py deploy        # 部署 Higress
+./higress_deploy.py create-lb     # 创建 ALB
+./higress_deploy.py status        # 查看状态
 # 获取访问地址
 cat alb-endpoint.txt
 ```
@@ -73,6 +104,7 @@ cat alb-endpoint.txt
 
 ```bash
 ./higress_deploy.py init              # 初始化配置文件
+./higress_deploy.py validate          # 验证配置文件完整性
 ./higress_deploy.py create            # 创建 EKS 集群（自动安装 EBS CSI Driver）
 ./higress_deploy.py install-ebs-csi   # 安装 EBS CSI Driver（可选，create 已包含）
 ./higress_deploy.py install-alb       # 安装 ALB Controller
@@ -80,6 +112,13 @@ cat alb-endpoint.txt
 ./higress_deploy.py create-lb         # 创建 ALB
 ./higress_deploy.py install-all       # 一键安装所有组件
 ./higress_deploy.py status            # 查看部署状态
+```
+
+### 故障修复命令
+
+```bash
+./higress_deploy.py fix-alb-security-group  # 修复 ALB Security Group 问题
+./higress_deploy.py fix-alb-permissions     # 修复 ALB IAM 权限问题
 ```
 
 ### 清理命令
@@ -111,9 +150,11 @@ make fix-webhook      # 修复 webhook 问题
 
 | 文档 | 说明 |
 |------|------|
+| [部署顺序指南](DEPLOYMENT-ORDER.md) | ⭐ 正确的部署步骤和顺序 |
 | [快速开始](docs/QUICK-START.md) | 5 分钟快速入门指南 |
 | [完整指南](docs/USER-GUIDE.md) | 详细使用文档 |
-| [验证指南](docs/VERIFICATION.md) | 集群验证和功能测试 ⭐ 新增 |
+| [StorageClass 配置](docs/STORAGE-CLASS.md) | ⭐ 新增 - 持久化存储配置 |
+| [验证指南](docs/VERIFICATION.md) | 集群验证和功能测试 |
 | [清理指南](docs/CLEANUP-GUIDE.md) | 资源清理详细说明 |
 | [故障排查](docs/TROUBLESHOOTING.md) | 常见问题和解决方案 |
 | [配置说明](docs/CONFIG-REFERENCE.md) | 配置文件详细说明 |
@@ -155,11 +196,25 @@ vim config.yaml               # 编辑配置
 
 # 修复 webhook 问题
 make fix-webhook
+
+# 验证配置
+./higress_deploy.py validate
 ```
 
 ### 常见问题
 
-**问题 1: IAM 权限不足（创建 ALB 失败）**
+**问题 1: ALB 创建失败 - Security Group 无效**
+
+```bash
+# 症状：InvalidConfigurationRequest: One or more security groups are invalid
+# 解决方案：
+./higress_deploy.py fix-alb-security-group
+
+# 或手动修复
+bash fix-alb-security-group.sh
+```
+
+**问题 2: IAM 权限不足（创建 ALB 失败）**
 
 ```bash
 # 症状：elasticloadbalancing:DescribeListenerAttributes 权限错误
@@ -173,7 +228,7 @@ kubectl delete ingress higress-alb -n higress-system
 ./higress_deploy.py create-lb
 ```
 
-**问题 2: Webhook 服务未就绪**
+**问题 3: Webhook 服务未就绪**
 
 ```bash
 # 解决方案
@@ -182,61 +237,18 @@ sleep 30
 ./higress_deploy.py deploy
 ```
 
-**问题 3: ALB 未创建**
+**问题 4: ALB 未创建**
 
 ```bash
 # 检查子网标签
 aws ec2 describe-subnets --subnet-ids <subnet-id> --query 'Subnets[*].Tags'
+
+# 检查 Ingress 状态
+kubectl describe ingress higress-alb -n higress-system
+
+# 查看 ALB Controller 日志
+kubectl logs -n kube-system deployment/aws-load-balancer-controller | tail -50
 ```
 
 更多问题请参考 [故障排查文档](docs/TROUBLESHOOTING.md)。
 
-## 💰 成本估算
-
-基于默认配置（3 个 c6i.xlarge 节点）：
-
-| 资源 | 月成本 |
-|------|--------|
-| EKS 控制平面 | $73 |
-| EC2 实例 (3×c6i.xlarge) | $367 |
-| EBS 卷 (3×100GB) | $24 |
-| ALB | $16 |
-| **总计** | **~$480/月** |
-
-## 🏗️ 架构
-
-```
-Internet → IGW → ALB (公有子网) → Higress (私有子网 EKS)
-                                      ↓
-                                  后端服务
-```
-
-- 跨 3 个可用区高可用部署
-- 自动扩缩容（HPA）
-- Pod 反亲和性确保分散部署
-
-## 🔒 安全特性
-
-- ✅ 节点部署在私有子网
-- ✅ IAM 最小权限原则
-- ✅ 支持 SSL/TLS 证书
-- ✅ 安全组最小化配置
-- ✅ 支持 VPC Flow Logs
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 📄 许可证
-
-MIT License
-
-## 🔗 相关链接
-
-- [Higress 官方文档](https://higress.io/)
-- [AWS EKS 用户指南](https://docs.aws.amazon.com/eks/latest/userguide/)
-- [AWS Load Balancer Controller](https://kubernetes-sigs.github.io/aws-load-balancer-controller/)
-
----
-
-**⭐ 如果这个项目对您有帮助，请给个 Star！**
