@@ -39,26 +39,33 @@
 bash setup.sh
 ```
 如果报错，分步骤
-# 安装 AWS CLI
+#### 安装 AWS CLI
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip
 sudo ./aws/install
 
-# 配置 AWS 凭证
+#### 配置 AWS 凭证
+```
 aws configure
 # 输入 Access Key ID、Secret Access Key、Region 等信息
+```
 
-# 安装 kubectl
+#### 安装 kubectl
+```
 curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 kubectl version --client
+```
 
-# 安装 eksctl
+#### 安装 eksctl
+```
 curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
 sudo mv /tmp/eksctl /usr/local/bin
 eksctl version
+```
 
-# 安装 Helm
+#### 安装 Helm
+```
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 helm version
 ```
